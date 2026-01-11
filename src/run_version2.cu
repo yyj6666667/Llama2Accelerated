@@ -114,18 +114,14 @@ void vediomem_init(GpuCtx* ctx, TransformerWeights* w, Config* p,
     unsigned long long n_layers = p->n_layers;
     size_t size;
 
-    #define CP_HOST2DEVICE(dst, src, len) do { \                    
-        int bytes = (len) * sizeof(float);     \                    
-        cudaMalloc(&(dst), bytes); \                                
+    #define CP_HOST2DEVICE(dst, src, len) do {                   \                    
+        int bytes = (len) * sizeof(float);                       \                    
+        cudaMalloc(&(dst), bytes);                               \                                
         cudaMemcpy((dst), (src), bytes, cudaMemcpyHostToDevice); \  
     } while (0)
 
-                                                     //之前写过一个传入func_name的版本
-                                                     //这种写法宏本身就是函数名
-                                                     //需要 do{} while(0)执行一次， 
-                                                     //';'调用处再添加
-
-    CP_HOST2DEVICE(ctx->d_token_embedding_table, w->token_embedding_table, p->vocab_size * dim); //以下是苦力活, 解放双手吧
+    CP_HOST2DEVICE(ctx->d_token_embedding_table, 
+    w->token_embedding_table, p->vocab_size * dim); 
     CP_HOST2DEVICE(ctx->d_wq, w->wq, n_layers * dim * dim);
     CP_HOST2DEVICE(ctx->d_wk, w->wk, n_layers * dim * kv_dim);
     CP_HOST2DEVICE(ctx->d_wv, w->wv, n_layers * dim * kv_dim);
@@ -134,10 +130,7 @@ void vediomem_init(GpuCtx* ctx, TransformerWeights* w, Config* p,
     CP_HOST2DEVICE(ctx->d_w2, w->w2, n_layers * dim * hidden_dim);
     CP_HOST2DEVICE(ctx->d_w3, w->w3, n_layers * dim * hidden_dim);
     CP_HOST2DEVICE(ctx->d_wcls, w->wcls, p->vocab_size * dim);            
-                                                 
-                                                 
-    //只剩下d_out, d_x 每次 有 io 开销了
-    // 不给d_x 写宏是因为太多了， 码起来收获不大
+                                                
     ctx->d_x = ctx->d_out = nullptr;
     ctx->cap_n = n_max;
     ctx->cap_d = d_max;

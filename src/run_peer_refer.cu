@@ -1,7 +1,5 @@
 /* Inference for Llama-2 Transformer model in pure C */
 
-#include <cuda_runtime.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -17,11 +15,7 @@
 #endif
 // ----------------------------------------------------------------------------
 // Transformer model
-
-//yyj
-//according to gdb info here we set the max_n and max_d
-#define NMAX 11016
-#define DMAX 32000
+float* d_x, *d_w, *d_xout;
 
 typedef struct {
     int dim; // transformer dimension
@@ -71,17 +65,6 @@ typedef struct {
     float* value_cache; // (layer, seq_len, dim)
 } RunState;
 
-
-// new
-typedef struct {
-    float* d_x ;
-    float* d_w ;
-    float* d_out ;
-    int cap_n , cap_d;
-                            //cap是capacity的缩写
-} MatmulCtx;
-            //Ctx 是上下文的意思
-
 typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights weights; // the weights of the model
@@ -90,39 +73,21 @@ typedef struct {
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
-    MatmulCtx vmemctx;
 } Transformer;
 
-//author : yyj
-void vediomem_init(MatmulCtx* ctx, int n_max, int d_max) {
-    ctx->d_x = ctx->d_w = ctx->d_out = nullptr;
-    ctx->cap_n = n_max;
-    ctx->cap_d = d_max;
-    cudaMalloc(&ctx->d_x, n_max * sizeof(float));
-    cudaMalloc(&ctx->d_w, n_max * d_max * sizeof(float));
-    cudaMalloc(&ctx->d_out, d_max * sizeof(float));
-}
-
-void vediomem_free(MatmulCtx* ctx) {
-    if (ctx->d_x) cudaFree(ctx->d_x);
-    if (ctx->d_w) cudaFree(ctx->d_w);
-    if (ctx->d_out) cudaFree(ctx->d_out);
-    ctx->d_x = ctx->d_w = ctx->d_out = nullptr;
-}
-
 void malloc_run_state(RunState* s, Config* p) {
-    // we (float*)calloc instead of malloc to keep valgrind happy
+    // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = (float*)calloc(p->dim, sizeof(float));
-    s->xb = (float*)calloc(p->dim, sizeof(float));
-    s->xb2 = (float*)calloc(p->dim, sizeof(float));
-    s->hb =  (float*)calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
-    s->q =   (float*)calloc(p->dim, sizeof(float));
-    s->key_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = (float*)calloc(p->vocab_size, sizeof(float));
+    s->x =            (float*)calloc(p->dim, sizeof(float));
+    s->xb =           (float*)calloc(p->dim, sizeof(float));
+    s->xb2 =          (float*)calloc(p->dim, sizeof(float));
+    s->hb =           (float*)calloc(p->hidden_dim, sizeof(float));
+    s->hb2 =          (float*)calloc(p->hidden_dim, sizeof(float));
+    s->q =            (float*)calloc(p->dim, sizeof(float));
+    s->key_cache =    (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->value_cache =  (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->att =          (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
+    s->logits =       (float*)calloc(p->vocab_size, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -202,14 +167,9 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
-
-    //yyj new add 
-    vediomem_init(&t->vmemctx, NMAX, DMAX);
 }
 
 void free_transformer(Transformer* t) {
-    //yyj add
-    vediomem_free(&(t->vmemctx));
     // close the memory mapping
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
     if (t->fd != -1) { close(t->fd); }
@@ -254,78 +214,41 @@ void softmax(float* x, int size) {
         x[i] /= sum;
     }
 }
-/*
+
+__global__ void matmul_kernel(float* xout, const float* x, const float* w, int n, int d) {
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        sum += w[blockIdx.x * n + i] * x[i];
+    }
+
+    extern __shared__ float s_mem[];
+    s_mem[threadIdx.x] = sum;
+    __syncthreads();
+
+    //reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if(threadIdx.x < stride) {
+            s_mem[threadIdx.x] += s_mem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        xout[blockIdx.x] = s_mem[0];
+}
+
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
-*/
-// need to ensure xout.. here is all cuda ptr
-__global__ void matmulkernel(float* xout, float* x, float* w, 
-    int n, int d) {
-        
-        extern __shared__ float shared_mem[];
+    cudaMemcpy(d_x, x, n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w, w, d * n * sizeof(float), cudaMemcpyHostToDevice);
 
-        float* w_row = w + blockIdx.x * n;
-        float* xout_row = xout + blockIdx.x;
+    int n_thread = 64;
+    int n_grid = d;
 
-        float sum_thread = 0.0f;
-        for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            sum_thread += w_row[i] * x[i];
-        }
-        shared_mem[threadIdx.x] = sum_thread;
-        __syncthreads();
+    matmul_kernel<<<n_grid, n_thread, n_thread * sizeof(float)>>>(d_xout, d_x, d_w, n, d);
 
-        //reduction, oh yeah yyj
-        for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-            if (threadIdx.x < stride) {
-                shared_mem[threadIdx.x] += shared_mem[stride + threadIdx.x];
-            }
-            __syncthreads();
-        }
-
-        if (threadIdx.x == 0) {  
-            float sum_row_final = shared_mem[0];
-            *xout_row = sum_row_final;
-                                //看似与grid无关， 其实都在不言中啊！
-        }
-}
-
-void matmul(MatmulCtx* ctx, float* xout, float* x, float* w, int n, int d,
-            cudaStream_t stream = 0) {
-                                    // caller没有stream的时候自动为0
-                                    // stream保证顺序执行
-    if (n > ctx->cap_n || d > ctx->cap_d) {
-        fprintf(stderr, "n, d, passed in is exceed capacity!!\n");
-        exit(1);
-    }
-
-    size_t bytes_x   = n * sizeof(float);
-    size_t bytes_w   = n * d * sizeof(float);
-    size_t bytes_out = d * sizeof(float);
-
-    cudaMemcpyAsync(ctx->d_x, x, bytes_x, cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(ctx->d_w, w, bytes_w, cudaMemcpyHostToDevice, stream);
-
-
-    int n_threads = 256;
-    matmulkernel<<<d, n_threads, n_threads * sizeof(float), stream>>>
-    (ctx->d_out, ctx->d_x, ctx->d_w, n, d);
-
-    cudaMemcpy(xout, ctx->d_out, bytes_out, cudaMemcpyDeviceToHost);
-                                                    //上面用Async是为了兼顾性能
-                                                    // 这里用Memcpy是为了做好同步
-                                                    // 确保matmul return 过后的数据都是安全的
-
+    cudaMemcpy(xout, d_xout, d * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
@@ -357,9 +280,9 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(&transformer->vmemctx, s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(&transformer->vmemctx, s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(&transformer->vmemctx, s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
@@ -419,7 +342,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention
-        matmul(&transformer->vmemctx, s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -431,8 +354,8 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(&transformer->vmemctx, s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(&transformer->vmemctx, s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -445,7 +368,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
-        matmul(&transformer->vmemctx, s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -457,7 +380,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(&transformer->vmemctx, s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
 
@@ -545,7 +468,7 @@ void safe_printf(char *piece) {
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
-    TokenIndex *res = (TokenIndex*) bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    TokenIndex *res = (TokenIndex*)bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
     return res != NULL ? res->id : -1;
 }
 
@@ -1005,6 +928,12 @@ void error_usage() {
 
 int main(int argc, char *argv[]) {
 
+    
+    d_x = d_w = d_xout = NULL;
+    //global create 
+    cudaMalloc((void**)&d_x, 2048 * sizeof(float));
+    cudaMalloc((void**)&d_w, 2048 * 32000 * sizeof(float));
+    cudaMalloc((void**)&d_xout, 32000 * sizeof(float));
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
     char *tokenizer_path = "tokenizer.bin";

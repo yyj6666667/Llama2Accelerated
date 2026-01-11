@@ -232,8 +232,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 */
 // need to ensure xout.. here is all cuda ptr
 __global__ void matmulkernel(float* xout, float* x, float* w, 
-    int n, int d) {
-        
+    int n, int d) {  
         extern __shared__ float shared_mem[];
 
         float* w_row = w + blockIdx.x * n;
@@ -246,7 +245,6 @@ __global__ void matmulkernel(float* xout, float* x, float* w,
         shared_mem[threadIdx.x] = sum_thread;
         __syncthreads();
 
-        //reduction, oh yeah yyj
         for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
             if (threadIdx.x < stride) {
                 shared_mem[threadIdx.x] += shared_mem[stride + threadIdx.x];
@@ -257,7 +255,6 @@ __global__ void matmulkernel(float* xout, float* x, float* w,
         if (threadIdx.x == 0) {  
             float sum_row_final = shared_mem[0];
             *xout_row = sum_row_final;
-                                //看似与grid无关， 其实都在不言中啊！
         }
 }
 
