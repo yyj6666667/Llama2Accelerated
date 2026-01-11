@@ -1,7 +1,9 @@
 # CUDA 加速 Llama2 
 
 ---
-完成实验的过程中，我**迭代**实现了3 个 CUDA 加速版本的 llama2，分别对应：
+origin repo: https://github.com/karpathy/llama2.c
+
+完成实验的过程中，**迭代**实现了3 个 CUDA 加速版本的 llama2，分别对应：
 
 - `src/run_naive.cu`
 - `src/run_version1.cu`
@@ -170,3 +172,5 @@ naive CUDA 版本中更加夸张：矩阵乘法只占计算周期中**蓝色**�
   - `cuda_naive_result.ipynb`
   - `cuda_version1_result.ipynb`
   - 以及其余 2 个 notebook（共 4 个，用于最终对比与结论）
+
+
